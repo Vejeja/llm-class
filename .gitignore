@@ -1,0 +1,28 @@
+.env# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Poetry
+.poetry/
+
+# dotenv
+.env
+.env.*.local
+
+# Pytest
+.pytest_cache/
+
+# Build
+build/
+dist/
+
+# IDEs
+.vscode/
+.idea/

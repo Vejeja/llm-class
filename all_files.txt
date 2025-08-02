@@ -1,0 +1,441 @@
+=== ./src/monitoring_dashboard/__init__.py ===
+import os
+import re
+import requests
+import json
+from abc import ABC
+from dotenv import load_dotenv, find_dotenv
+
+# 1) Подгружаем .env из корня проекта
+load_dotenv(find_dotenv())
+
+# 2) Конфигурация API
+API_URL = os.getenv("OPENROUTER_API_URL")
+EMB_URL = os.getenv("OPENROUTER_EMB_URL")
+API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+if not (API_URL and EMB_URL and API_KEY):
+    raise RuntimeError(
+        "Не найдены OPENROUTER_API_URL, OPENROUTER_EMB_URL или OPENROUTER_API_KEY в .env"
+    )
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json"
+}
+
+# Тестовый клиент для pytest
+class DummyHfClient:
+    def __init__(self, model_name: str):
+        pass
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+
+# Модельные имена из .env
+MODELS = {
+    "intent":        os.getenv("INTENT_MODEL"),
+    "embedding":     os.getenv("EMBEDDING_MODEL"),
+    "translator":    os.getenv("TRANSLATOR_MODEL"),
+    "query_builder": os.getenv("QUERY_BUILDER_MODEL"),
+}
+
+
+class BaseModel(ABC):
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+
+
+class LLMModel(BaseModel):
+    def predict(self, prompt: str, temperature: float = 0.0) -> str:
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature
+        }
+        r = requests.post(API_URL, json=payload, headers=HEADERS)
+        try:
+            r.raise_for_status()
+        except Exception:
+            print(f"[LLMModel] HTTP Error {r.status_code}:")
+            print(r.text[:1000])
+            raise
+        try:
+            data = r.json()
+        except ValueError:
+            print(f"[LLMModel] Не удалось распарсить JSON:")
+            print(r.text[:1000])
+            raise
+        return data["choices"][0]["message"]["content"].strip()
+
+
+class EmbeddingModel(BaseModel):
+    """Эмбеддинги через sentence-transformers."""
+    def __init__(self, model_name: str):
+        super().__init__(model_name)
+        from sentence_transformers import SentenceTransformer
+        self.client = SentenceTransformer(model_name)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        embs = self.client.encode(texts, convert_to_numpy=True)
+        return embs.tolist()
+
+
+class TranslatorModel(LLMModel):
+    def translate_to_en(self, text: str) -> str:
+        return self.predict(f"Translate to English: \"{text}\"")
+    def translate_to_ru(self, text: str) -> str:
+        return self.predict(f"Переведи на русский: \"{text}\"")
+
+
+class ModelFactory:
+    def __init__(self, override: dict[str, str] | None = None):
+        cfg = MODELS.copy()
+        if override:
+            cfg.update(override)
+        self.cfg = cfg
+
+    def get_intent(self) -> LLMModel:
+        return LLMModel(self.cfg["intent"])
+    def get_embedding(self) -> EmbeddingModel:
+        return EmbeddingModel(self.cfg["embedding"])
+    def get_translator(self) -> TranslatorModel:
+        return TranslatorModel(self.cfg["translator"])
+    def get_query_builder(self) -> LLMModel:
+        return LLMModel(self.cfg["query_builder"])
+
+
+class IntentParser:
+    def __init__(self, factory: ModelFactory | None = None):
+        self.client = (factory or ModelFactory()).get_intent()
+
+    def parse(self, user_query: str) -> dict:
+        prompt = (
+            "Вы — парсер намерений. Верните строго JSON:"
+            "{intent, confidence, entities{...}}\n"
+            f"Запрос: \"{user_query}\""
+        )
+        resp = self.client.predict(prompt)
+        # снимаем ```json``` обёртки
+        resp = re.sub(r"^```(?:json)?\s*", "", resp, flags=re.IGNORECASE)
+        resp = re.sub(r"\s*```$", "", resp).strip()
+        if not resp:
+            raise RuntimeError("LLM вернула пустой ответ при intent-парсинге")
+
+        data = json.loads(resp)
+        ents = data.get("entities", {})
+
+        # Унифицируем ключ для описания метрики
+        for key in ("metric_description_query", "metric", "metric_name", "description"):
+            if key in ents:
+                ents["metric_description_query"] = ents[key]
+                break
+
+        data["entities"] = ents
+        return data
+
+
+class MetricRetriever:
+    def __init__(self, factory: ModelFactory | None = None, db_client=None):
+        self.embedder = (factory or ModelFactory()).get_embedding()
+        self.db = db_client
+
+    def retrieve(self, query: str, top_k: int = 5) -> list[str]:
+        vec = self.embedder.embed([query])[0]
+        results = self.db.query(vec, top_k=top_k)
+        return [r["metric"] for r in results]
+
+
+class PromQLBuilder:
+    def __init__(self, factory: ModelFactory | None = None):
+        self.client = (factory or ModelFactory()).get_query_builder()
+
+    def build(self, intent_json: dict, metrics: list[str]) -> dict:
+        prompt = (
+            f"Input JSON: {json.dumps(intent_json)}\n"
+            f"Available metrics: {metrics}\n"
+            "Верните JSON {status, confidence, reasoning, response{query, message}}"
+        )
+        resp = self.client.predict(prompt)
+        resp = re.sub(r"^```(?:json)?\s*", "", resp, flags=re.IGNORECASE)
+        resp = re.sub(r"\s*```$", "", resp).strip()
+
+        try:
+            return json.loads(resp)
+        except json.JSONDecodeError:
+            print("[PromQLBuilder] Некорректный JSON:")
+            print(resp)
+            raise
+
+=== ./pyproject.toml ===
+[tool.poetry]
+name = "dashboard-llm"
+version = "0.1.0"
+description = ""
+authors = ["Vejeja <kornilova.valeriia@gmail.com>"]
+
+packages = [
+  { include = "monitoring_dashboard", from = "src" }
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+requests = "^2.31.0"
+python-dotenv = "^1.0.0"
+langchain-huggingface = "^0.1.0"    # новая библиотека
+sentence-transformers = "^2.2.2"
+
+[tool.poetry.dev-dependencies]
+pytest = "^7.0.0"
+
+[tool.poetry.scripts]
+monitoring-dashboard = "main:main"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+=== ./main.py ===
+import argparse
+from monitoring_dashboard import (
+    ModelFactory,
+    IntentParser,
+    MetricRetriever,
+    PromQLBuilder,
+)
+
+class DummyDB:
+    def query(self, vector, top_k=5):
+        return [
+            {"metric": "node_cpu_seconds_total"},
+            {"metric": "node_memory_MemAvailable_bytes"}
+        ]
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("query", help="Запрос на естественном языке")
+    parser.add_argument(
+        "--override",
+        nargs="*",
+        help="Override моделей: intent=..., embedding=..."
+    )
+    args = parser.parse_args()
+
+    override = dict(item.split("=", 1) for item in (args.override or []))
+    factory = ModelFactory(override)
+
+    intent = IntentParser(factory).parse(args.query)
+    desc   = intent["entities"]["metric_description_query"]
+    metrics = MetricRetriever(factory, DummyDB()).retrieve(desc)
+
+    result = PromQLBuilder(factory).build(intent, metrics)
+
+    print("PromQL:", result["response"]["query"])
+    print("Reasoning:", result["reasoning"])
+
+if __name__ == "__main__":
+    main()
+
+=== ./.env ===
+# OpenRouter API
+OPENROUTER_API_KEY=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
+OPENROUTER_API_URL=https://openrouter.ai/api/v1/chat/completions
+OPENROUTER_EMB_URL=https://openrouter.ai/api/v1/embeddings
+
+# Модели
+INTENT_MODEL=deepseek/deepseek-chat-v3-0324:free
+EMBEDDING_MODEL=deepvk/USER-bge-m3
+TRANSLATOR_MODEL=deepseek/deepseek-r1-0528:free
+QUERY_BUILDER_MODEL=qwen/qwen3-235b-a22b:free
+=== ./tests/test_query_builder.py ===
+import pytest
+import json
+from monitoring_dashboard import PromQLBuilder, ModelFactory
+
+class DummyLLM:
+    def predict(self, prompt: str, temperature: float = 0.0) -> str:
+        # Эмулируем ответ билдера PromQL
+        return json.dumps({
+            "status": "success",
+            "confidence": 0.8,
+            "reasoning": "simple reasoning",
+            "response": {
+                "query": "up",
+                "message": "ok"
+            }
+        })
+
+@pytest.fixture(autouse=True)
+def patch_query_builder(monkeypatch):
+    # Заставляем ModelFactory.get_query_builder() возвращать DummyLLM
+    monkeypatch.setattr(
+        ModelFactory,
+        "get_query_builder",
+        lambda self: DummyLLM()
+    )
+
+def test_query_builder():
+    builder = PromQLBuilder()
+    intent_json = {
+        "intent": "get_timeseries_metric",
+        "entities": {"metric_description_query": "cpu"}
+    }
+    metrics = ["m1", "m2"]
+    result = builder.build(intent_json, metrics)
+    assert result["status"] == "success"
+    assert result["response"]["query"] == "up"
+    assert result["confidence"] == pytest.approx(0.8)
+
+=== ./tests/test_embedding_model.py ===
+import pytest
+import monitoring_dashboard
+from monitoring_dashboard import EmbeddingModel, DummyHfClient
+
+class DummyHfClient:
+    def __init__(self, model_name):
+        pass
+    def embed_documents(self, texts):
+        return [[0.1,0.2,0.3],[0.4,0.5,0.6]]
+
+@pytest.fixture(autouse=True)
+def patch_hf(monkeypatch):
+    def fake_init(self, model_name):
+        self.client = DummyHfClient(model_name)
+    monkeypatch.setattr(
+        monitoring_dashboard.EmbeddingModel,
+        '__init__',
+        fake_init
+    )
+
+def test_embedding_model():
+    emb = EmbeddingModel("dummy-model")
+    vectors = emb.embed(["text1", "text2"])
+    assert isinstance(vectors, list)
+    assert len(vectors) == 2
+    assert vectors[0] == [0.1, 0.2, 0.3]
+    assert vectors[1] == [0.4, 0.5, 0.6]
+
+=== ./tests/test_translator_model.py ===
+from monitoring_dashboard import TranslatorModel
+
+class DummyTranslator(TranslatorModel):
+    def __init__(self):
+        super().__init__("dummy-model")
+    def predict(self, prompt: str, temperature: float = 0.0) -> str:
+        # Эмулируем перевод по префиксу промта
+        if prompt.startswith("Translate to English"):
+            return "translated to english"
+        if prompt.startswith("Переведи на русский"):
+            return "переведено на русский"
+        return ""
+
+def test_translate_to_en():
+    tr = DummyTranslator()
+    out = tr.translate_to_en("текст на русском")
+    assert out == "translated to english"
+
+def test_translate_to_ru():
+    tr = DummyTranslator()
+    out = tr.translate_to_ru("some text")
+    assert out == "переведено на русский"
+
+=== ./tests/test_metric_retriever.py ===
+import pytest
+from monitoring_dashboard import MetricRetriever, ModelFactory
+
+class DummyEmbed:
+    def embed(self, texts):
+        # Возвращаем фиктивный вектор для любого текста
+        return [[1.23, 4.56]]
+
+class DummyDB:
+    def query(self, vector, top_k=5):
+        # Эмулируем выдачу списка метрик
+        return [{"metric": "m1"}, {"metric": "m2"}]
+
+@pytest.fixture(autouse=True)
+def patch_embedding_model(monkeypatch):
+    # Заставляем ModelFactory.get_embedding() возвращать DummyEmbed
+    monkeypatch.setattr(
+        ModelFactory,
+        "get_embedding",
+        lambda self: DummyEmbed()
+    )
+
+def test_metric_retriever():
+    factory = ModelFactory()
+    db = DummyDB()
+    retr = MetricRetriever(factory, db)
+    metrics = retr.retrieve("cpu usage", top_k=2)
+    assert metrics == ["m1", "m2"]
+
+=== ./tests/test_intent_parser.py ===
+import pytest
+import json
+from monitoring_dashboard import IntentParser, ModelFactory
+
+class DummyLLM:
+    def predict(self, prompt: str, temperature: float = 0.0) -> str:
+        return json.dumps({
+            "intent": "get_timeseries_metric",
+            "confidence": 0.92,
+            "entities": {
+                "metric_description_query": "cpu usage",
+                "time_range": {"unit": "hours", "value": 1}
+            }
+        })
+
+@pytest.fixture(autouse=True)
+def patch_intent_model(monkeypatch):
+    monkeypatch.setattr(
+        ModelFactory,
+        "get_intent",
+        lambda self: DummyLLM()
+    )
+
+def test_intent_parser():
+    parser = IntentParser()
+    result = parser.parse("Покажи CPU за последний час")
+    assert result["intent"] == "get_timeseries_metric"
+    assert result["confidence"] == pytest.approx(0.92)
+    assert result["entities"]["metric_description_query"] == "cpu usage"
+    assert result["entities"]["time_range"]["value"] == 1
+
+=== ./all_files.txt ===
+
+=== ./.gitignore ===
+.env
+=== ./.pytest_cache/README.md ===
+# pytest cache directory #
+
+This directory contains data from the pytest's cache plugin,
+which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+
+**Do not** commit this to version control.
+
+See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+
+=== ./.pytest_cache/CACHEDIR.TAG ===
+Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by pytest.
+# For information about cache directory tags, see:
+#	https://bford.info/cachedir/spec.html
+
+=== ./.pytest_cache/v/cache/stepwise ===
+[]
+=== ./.pytest_cache/v/cache/lastfailed ===
+{
+  "tests/test_embedding_model.py::test_embedding_model": true
+}
+=== ./.pytest_cache/v/cache/nodeids ===
+[
+  "tests/test_embedding_model.py::test_embedding_model",
+  "tests/test_intent_parser.py::test_intent_parser",
+  "tests/test_metric_retriever.py::test_metric_retriever",
+  "tests/test_query_builder.py::test_query_builder",
+  "tests/test_translator_model.py::test_translate_to_en",
+  "tests/test_translator_model.py::test_translate_to_ru"
+]
+=== ./.pytest_cache/.gitignore ===
+# Created by pytest automatically.
+*
+
